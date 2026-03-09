@@ -1,0 +1,5 @@
+{
+  "name": "Remix: SCOUT v1",
+  "description": "The Digital Scout for Deep Energy Retrofits. Maps the terrain, identifies vulnerabilities, and signals when to deploy engineering resources.",
+  "requestFramePermissions": []
+}
