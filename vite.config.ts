@@ -1,23 +1,25 @@
 import path from 'path';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
-    return {
-      server: {
-        port: 3000,
-        host: '0.0.0.0',
+export default defineConfig({
+    server: {
+      port: 3000,
+      host: '0.0.0.0',
+      proxy: {
+        // Proxy /api requests to Vercel-style functions during local dev
+        '/api': {
+          target: 'http://localhost:3000',
+          // In dev, Vite will serve the SPA; use a Vite plugin or run
+          // the API separately. For now, this placeholder ensures
+          // the fetch calls don't 404 in dev (see README for local setup).
+        },
       },
-      plugins: [react()],
-      define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
-      },
-      resolve: {
-        alias: {
-          '@': path.resolve(__dirname, '.'),
-        }
+    },
+    plugins: [react()],
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
       }
-    };
+    }
 });

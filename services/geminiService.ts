@@ -1,15 +1,30 @@
 
-import { GoogleGenAI, Chat, GenerateContentResponse, Type } from "@google/genai";
 import { BuildingData, MaturityLevel, Persona, RetrofitMeasure, SimulationContext, ActionPlan, Source, ChatMessage } from '../types';
 import { MEASURE_CATALOG } from '../data/measures';
+import { Type } from "@google/genai";
 
-const API_KEY = process.env.API_KEY || '';
+// --- API Proxy Layer ---
+// All Gemini calls go through /api/gemini to keep the API key server-side.
 
-// Initialize client securely
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+interface ProxyResponse {
+    text: string;
+    sources: Source[];
+}
 
-// Explicitly using Gemini 3 Pro for deep reasoning and search capabilities
-const SEARCH_MODEL = 'gemini-3.1-pro-preview';
+const callGeminiProxy = async (body: Record<string, any>): Promise<ProxyResponse> => {
+    const res = await fetch('/api/gemini', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Request failed' }));
+        throw new Error(err.error || `API proxy error: ${res.status}`);
+    }
+
+    return res.json();
+};
 
 // Helper to extract and parse JSON from a Markdown-formatted string
 const safeParseJson = (text: string) => {
@@ -27,32 +42,8 @@ const safeParseJson = (text: string) => {
     }
 };
 
-// Helper to extract grounding metadata (sources)
-const extractSources = (response: GenerateContentResponse): Source[] => {
-    const sources: Source[] = [];
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-    
-    if (chunks) {
-        chunks.forEach((chunk: any) => {
-            if (chunk.web && chunk.web.uri) {
-                let title = chunk.web.title;
-                try {
-                     if (!title) title = new URL(chunk.web.uri).hostname;
-                } catch (e) {
-                     title = "External Source";
-                }
-                
-                sources.push({
-                    title: title,
-                    url: chunk.web.uri
-                });
-            }
-        });
-    }
-    
-    // Deduplicate based on URL
-    return Array.from(new Map(sources.map(s => [s.url, s])).values());
-};
+// Explicitly using Gemini 3 Pro for deep reasoning and search capabilities
+const SEARCH_MODEL = 'gemini-3.1-pro-preview';
 
 const SCOUT_SYSTEM_INSTRUCTION = `
 You are SCOUT (Scope, Optimize, Unify, Track), an advanced AI Building Retrofit Assistant.
@@ -74,7 +65,17 @@ Rules:
 - Format your responses using simple Markdown (bolding for emphasis, bullet points for lists).
 `;
 
-export const createScoutChat = (persona?: Persona): Chat => {
+// --- Chat State Management ---
+// Since serverless functions are stateless, we maintain chat history client-side
+// and send it with each request.
+
+interface ChatSession {
+    history: { role: string; parts: { text: string }[] }[];
+    model: string;
+    config: Record<string, any>;
+}
+
+export const createScoutChat = (persona?: Persona): ChatSession => {
   let finalSystemInstruction = SCOUT_SYSTEM_INSTRUCTION;
 
   if (persona === 'Owner / Manager') {
@@ -88,9 +89,7 @@ export const createScoutChat = (persona?: Persona): Chat => {
     \n**MODIFIED DIRECTIVE FOR TRADES:** Your current user is a contractor. Focus on installation details and specs.`;
   }
 
-  // NOTE: We prime the history instead of using 'systemInstruction' config to ensure stability with Tools
-  return ai.chats.create({
-    model: SEARCH_MODEL,
+  return {
     history: [
         {
             role: 'user',
@@ -101,11 +100,12 @@ export const createScoutChat = (persona?: Persona): Chat => {
             parts: [{ text: "Understood. I am online and ready to assist as Scout." }],
         }
     ],
+    model: SEARCH_MODEL,
     config: {
       temperature: 0.7,
-      tools: [{googleSearch: {}}], 
+      tools: [{googleSearch: {}}],
     },
-  });
+  };
 };
 
 export interface ScoutSearchResponse {
@@ -124,7 +124,7 @@ export const generateBuildingInsights = async (address: string): Promise<ScoutSe
     1. Determine the ASHRAE Climate Zone.
     2. Find HDD and CDD.
     3. Identify the Province or Territory (e.g., ON, BC, QC).
-    
+
     TASK 2: BUILDING DATA RECONNAISSANCE
     1. Conduct a deep investigation for the building at this address.
     2. Populate the 'Building Metadata' with specific, factual data.
@@ -133,7 +133,7 @@ export const generateBuildingInsights = async (address: string): Promise<ScoutSe
     TASK 3: ECM SCOPE DEVELOPMENT
     1. Adopt the persona of a senior energy engineer.
     2. Select up to 7 of the most impactful measures from the catalog.
-    
+
     TASK 4: FINAL JSON OUTPUT
     Return a JSON object ONLY inside a \`\`\`json\`\`\` markdown block.
     - "insight": A friendly 2-3 sentence summary.
@@ -145,7 +145,7 @@ export const generateBuildingInsights = async (address: string): Promise<ScoutSe
     ECM CATALOG:
     ${measureCatalogString}
     `;
-    
+
     const fallbackData: ScoutSearchResponse = {
         insight: "**Reconnaissance Report:** I couldn't access the live satellite feed for this location, so I've established a tactical baseline based on typical buildings in this sector. Please verify the perimeter details.",
         buildingData: {
@@ -174,19 +174,20 @@ export const generateBuildingInsights = async (address: string): Promise<ScoutSe
 
     try {
         // Extended timeout for Gemini 3 Pro Preview as it 'thinks' longer
-        const timeoutPromise = new Promise<never>((_, reject) => 
+        const timeoutPromise = new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error("Request timed out")), 180000)
         );
 
-        const apiPromise = ai.models.generateContent({
-            model: SEARCH_MODEL, // Explicitly using gemini-3-pro-preview
-            contents: prompt,
+        const apiPromise = callGeminiProxy({
+            action: 'generateContent',
+            model: SEARCH_MODEL,
+            prompt,
             config: {
                 tools: [{googleSearch: {}}],
             }
         });
 
-        const response = await Promise.race([apiPromise, timeoutPromise]) as GenerateContentResponse;
+        const response = await Promise.race([apiPromise, timeoutPromise]);
 
         if (response.text) {
             const result = safeParseJson(response.text);
@@ -220,16 +221,17 @@ export const verifyAttributeWithAI = async (address: string, field: string, curr
           setTimeout(() => reject(new Error("Verification request timed out")), 120000)
         );
 
-        const apiPromise = ai.models.generateContent({
+        const apiPromise = callGeminiProxy({
+            action: 'generateContent',
             model: SEARCH_MODEL,
-            contents: prompt,
+            prompt,
             config: {
                 tools: [{googleSearch: {}}],
             }
         });
 
-        const response = await Promise.race([apiPromise, timeoutPromise]) as GenerateContentResponse;
-        
+        const response = await Promise.race([apiPromise, timeoutPromise]);
+
         if (response.text) {
              return safeParseJson(response.text);
         }
@@ -241,24 +243,24 @@ export const verifyAttributeWithAI = async (address: string, field: string, curr
 };
 
 export const generateReport = async (
-    userPrompt: string, 
-    buildingData: BuildingData, 
+    userPrompt: string,
+    buildingData: BuildingData,
     simContext?: SimulationContext
 ): Promise<{ text: string, sources: Source[] }> => {
-    
+
     // NOTE: We inject system instructions into the prompt content to improve stability with Google Search tools
     const fullPrompt = `
     SYSTEM INSTRUCTION:
     You are an expert building science consultant and senior report writer.
     Generate a professional, high-impact report in **GitHub Flavored Markdown**.
-    
+
     STRUCTURE:
     - Executive Summary
     - Project Scope
     - Financial Analysis
     - Environmental Impact
     - Strategic Recommendations
-    
+
     USER REQUEST: "${userPrompt}"
 
     BUILDING DATA:
@@ -273,26 +275,27 @@ export const generateReport = async (
 
     Generate the report now. If you use external search data, please reference it in the text.
     `;
-    
+
     try {
-         const response = await ai.models.generateContent({
+         const response = await callGeminiProxy({
+            action: 'generateContent',
             model: SEARCH_MODEL,
-            contents: fullPrompt,
+            prompt: fullPrompt,
             config: {
-                tools: [{googleSearch: {}}], 
+                tools: [{googleSearch: {}}],
             }
         });
-        
-        const sources = extractSources(response);
-        const text = response.text || "Sorry, I was unable to generate the report. Please try rephrasing your request.";
 
-        return { text, sources };
+        return {
+            text: response.text || "Sorry, I was unable to generate the report. Please try rephrasing your request.",
+            sources: response.sources || [],
+        };
 
     } catch(e: any) {
         console.error("Report generation failed", e);
-        return { 
-            text: `**Error Generating Report:** ${e.message || "Connection failed."}. \n\nPlease try again with a shorter prompt or check your connection.`, 
-            sources: [] 
+        return {
+            text: `**Error Generating Report:** ${e.message || "Connection failed."}. \n\nPlease try again with a shorter prompt or check your connection.`,
+            sources: []
         };
     }
 };
@@ -309,7 +312,7 @@ export const generateGrantApplication = async (
     const payback = simContext?.paybackYears || 0;
 
     const prompt = `
-    You are a Senior Grant Writer for commercial retrofit projects. 
+    You are a Senior Grant Writer for commercial retrofit projects.
     Write a formal application narrative for the "${grantName}".
 
     PROJECT DETAILS:
@@ -325,7 +328,7 @@ export const generateGrantApplication = async (
 
     OUTPUT FORMAT:
     Produce a structured narrative suitable for copy-pasting into a government or utility application portal.
-    
+
     SECTION 1: PROJECT EXECUTIVE SUMMARY
     [Professional summary of the scope and objectives]
 
@@ -337,14 +340,16 @@ export const generateGrantApplication = async (
 
     SECTION 4: FINANCIAL BARRIER STATEMENT
     [Explanation of why funding is required to proceed, citing the ${payback.toFixed(1)} year payback period]
-    
+
     Tone: Professional, Technical, Persuasive.
     `;
 
     try {
-        const response = await ai.models.generateContent({
+        const response = await callGeminiProxy({
+            action: 'generateContent',
             model: 'gemini-3-pro-preview',
-            contents: prompt,
+            prompt,
+            config: {},
         });
         return response.text || "Error generating application.";
     } catch (e) {
@@ -354,7 +359,7 @@ export const generateGrantApplication = async (
 };
 
 export const generateActionPlan = async (
-    buildingData: BuildingData, 
+    buildingData: BuildingData,
     simContext?: SimulationContext,
     eligibleIncentives?: any[]
 ): Promise<ActionPlan> => {
@@ -375,21 +380,21 @@ export const generateActionPlan = async (
                         name: { type: Type.STRING },
                         timeline: { type: Type.STRING },
                         technicalDetails: { type: Type.STRING },
-                        standards: { 
-                            type: Type.ARRAY, 
-                            items: { type: Type.STRING } 
+                        standards: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING }
                         },
-                        steps: { 
-                            type: Type.ARRAY, 
-                            items: { type: Type.STRING } 
+                        steps: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING }
                         }
                     },
                     required: ["name", "timeline", "technicalDetails", "standards", "steps"]
                 }
             },
-            incentiveStrategy: { 
-                type: Type.ARRAY, 
-                items: { type: Type.STRING } 
+            incentiveStrategy: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
             },
             localPartners: {
                 type: Type.ARRAY,
@@ -426,30 +431,31 @@ export const generateActionPlan = async (
     **OUTPUT:**
     Return a JSON object matching the schema.
     `;
-    
+
     try {
-        const timeoutPromise = new Promise<never>((_, reject) => 
+        const timeoutPromise = new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error("Action Plan generation timed out")), 60000)
         );
 
         // Switch to 'gemini-3-flash-preview' for high-speed, stable structured output
         // Removed 'googleSearch' tool to prevent 500 errors during complex structured generation
-        const apiPromise = ai.models.generateContent({
-            model: 'gemini-3-flash-preview', 
-            contents: prompt,
+        const apiPromise = callGeminiProxy({
+            action: 'generateContent',
+            model: 'gemini-3-flash-preview',
+            prompt,
             config: {
                 responseMimeType: 'application/json',
                 responseSchema: responseSchema,
             }
         });
-        
-        const response = await Promise.race([apiPromise, timeoutPromise]) as GenerateContentResponse;
-        
+
+        const response = await Promise.race([apiPromise, timeoutPromise]);
+
         const jsonText = response.text?.trim();
         if (!jsonText) throw new Error("Empty response text");
 
         const parsed = JSON.parse(jsonText);
-        
+
         return parsed as ActionPlan;
 
     } catch(e) {
@@ -484,20 +490,30 @@ export const generateActionPlan = async (
 }
 
 
-export const sendMessageToScout = async (chat: Chat, message: string, context?: string): Promise<{text: string, sources: Source[]}> => {
+export const sendMessageToScout = async (chat: ChatSession, message: string, context?: string): Promise<{text: string, sources: Source[]}> => {
   try {
-    const finalMessage = context 
+    const finalMessage = context
         ? `[SYSTEM CONTEXT: The user is currently viewing this data: ${context}]. \n\n USER QUERY: ${message}`
         : message;
 
-    const response: GenerateContentResponse = await chat.sendMessage({ 
+    const response = await callGeminiProxy({
+        action: 'chat',
+        model: chat.model,
+        history: chat.history,
         message: finalMessage,
+        config: chat.config,
     });
-    
-    const text = response.text || "I didn't catch that. Could you rephrase?";
-    const sources = extractSources(response);
 
-    return { text, sources };
+    // Update local history for subsequent messages
+    chat.history.push(
+        { role: 'user', parts: [{ text: finalMessage }] },
+        { role: 'model', parts: [{ text: response.text }] }
+    );
+
+    return {
+        text: response.text || "I didn't catch that. Could you rephrase?",
+        sources: response.sources || [],
+    };
 
   } catch (error: any) {
     console.error("Gemini Chat Error", error);
